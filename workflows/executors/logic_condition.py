@@ -87,16 +87,23 @@ class ConditionExecutor(BaseExecutor):
     """
 
     def run(self) -> dict:
-        condition    = self.cfg('condition',   '').strip()
-        true_branch  = self.cfg('trueBranch',  'Vrai').strip()
-        false_branch = self.cfg('falseBranch', 'Faux').strip()
-        output_key   = self.cfg('outputKey',   'condition_result').strip() or 'condition_result'
-        stop_on_false = self.cfg('stopOnFalse', False)
+        # Nouveau nom: expression — ancien: condition (rétrocompat)
+        condition = (
+            self.cfg('expression', '').strip()
+            or self.cfg('condition', '').strip()
+        )
+        # Nouveau nom: true_label / false_label — anciens: trueBranch / falseBranch
+        true_branch  = (self.cfg('true_label',  '') or self.cfg('trueBranch',  'Vrai')).strip()
+        false_branch = (self.cfg('false_label', '') or self.cfg('falseBranch', 'Faux')).strip()
+        # Nouveau nom: stop_on_false — ancien: stopOnFalse
+        stop_on_false = self.cfg('stop_on_false', None)
+        if stop_on_false is None:
+            stop_on_false = self.cfg('stopOnFalse', False)
 
         if not condition:
             raise RuntimeError(
                 "[Condition] Aucune condition configurée.\n"
-                "Renseignez le champ 'condition' (ex: {{environment}} == 'PROD')."
+                "Renseignez le champ 'expression' (ex: {{env_target}} == 'PROD')."
             )
 
         logger.info(f'[Condition] Évaluation : {condition}')
@@ -117,7 +124,7 @@ class ConditionExecutor(BaseExecutor):
             )
 
         return {
-            output_key:             result,
+            'condition_result':     result,
             'condition_expression': condition,
             'condition_branch':     branch,
             'condition_true':       result,

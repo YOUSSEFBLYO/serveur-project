@@ -1,27 +1,13 @@
 from django.contrib import admin
-from .models import Workflow, WorkflowNode, WorkflowEdge, Execution, NodeExecution, Approval, AuditLog
-
-
-class WorkflowNodeInline(admin.TabularInline):
-    model  = WorkflowNode
-    extra  = 0
-    fields = ['node_id', 'node_type', 'label', 'status', 'order']
-    readonly_fields = ['status']
-
-
-class WorkflowEdgeInline(admin.TabularInline):
-    model  = WorkflowEdge
-    extra  = 0
-    fields = ['edge_id', 'source', 'target', 'label']
+from .models import Workflow, Execution, NodeExecution, Approval, AuditLog
 
 
 @admin.register(Workflow)
 class WorkflowAdmin(admin.ModelAdmin):
-    list_display  = ['name', 'workflow_type', 'category', 'creator_name', 'status', 'created_at']
-    list_filter   = ['status', 'workflow_type', 'category']
-    search_fields = ['name', 'creator_name']
+    list_display    = ['name', 'workflow_type', 'priority', 'creator_name', 'status', 'is_template', 'created_at']
+    list_filter     = ['status', 'workflow_type', 'priority', 'is_template']
+    search_fields   = ['name', 'creator_name']
     readonly_fields = ['created_at', 'updated_at']
-    inlines       = [WorkflowNodeInline, WorkflowEdgeInline]
 
 
 class NodeExecutionInline(admin.TabularInline):
@@ -54,6 +40,6 @@ class ApprovalAdmin(admin.ModelAdmin):
 
 @admin.register(AuditLog)
 class AuditLogAdmin(admin.ModelAdmin):
-    list_display = ['event_type', 'actor', 'execution', 'created_at']
-    list_filter  = ['event_type']
+    list_display    = ['event_type', 'actor', 'execution', 'created_at']
+    list_filter     = ['event_type']
     readonly_fields = ['created_at']
