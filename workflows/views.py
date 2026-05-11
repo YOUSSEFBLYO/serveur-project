@@ -107,13 +107,23 @@ def workflow_launch(request, pk):
         context=request.data.get('context', {}),
     )
 
-    launch_execution_async(execution.id)
+    try:
+        launch_execution_async(execution.id)
+    except Exception as broker_error:
+        # Redis / Celery indisponible → annuler l'exécution créée
+        execution.status        = 'FAILED'
+        execution.error_message = f'Broker indisponible : {broker_error}'
+        execution.save(update_fields=['status', 'error_message'])
+        return Response(
+            {'error': f'Impossible de joindre le broker Celery : {broker_error}'},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
 
     return Response({
         'execution_id': execution.id,
         'workflow_id':  workflow.id,
         'status':       execution.status,
-        'message':      'Exécution lancée en arrière-plan.',
+        'message':      'Exécution envoyée au worker Celery.',
     }, status=status.HTTP_202_ACCEPTED)
 
 

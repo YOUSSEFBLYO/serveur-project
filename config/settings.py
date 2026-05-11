@@ -126,6 +126,26 @@ STATIC_URL = 'static/'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Celery — Broker Redis (Docker 6379) + Backend Redis (6380)
+# ══════════════════════════════════════════════════════════════════════════════
+
+CELERY_BROKER_URL          = 'redis://localhost:6379/0'   # file d'attente des tâches
+CELERY_RESULT_BACKEND      = 'redis://localhost:6379/1'   # résultats des tâches
+CELERY_ACCEPT_CONTENT      = ['json']
+CELERY_TASK_SERIALIZER     = 'json'
+CELERY_RESULT_SERIALIZER   = 'json'
+CELERY_TIMEZONE            = 'UTC'
+CELERY_TASK_TRACK_STARTED  = True       # statut STARTED visible dans le monitoring
+CELERY_TASK_TIME_LIMIT     = 3600       # 1 h max par tâche (sécurité)
+CELERY_TASK_SOFT_TIME_LIMIT = 3500      # avertissement 100 s avant la limite dure
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1   # 1 tâche à la fois par worker
+CELERY_TASK_ACKS_LATE      = True       # acquitter après exécution (pas avant)
+CELERY_WORKER_MAX_TASKS_PER_CHILD = 50  # redémarre le worker après 50 tâches
+
+# Windows : prefork (fork) n'existe pas → utiliser solo (dev) ou threads (prod)
+CELERY_WORKER_POOL         = 'solo'     # pool solo : tâches séquentielles dans le même process
+
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
 

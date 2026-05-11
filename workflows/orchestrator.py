@@ -1,7 +1,5 @@
 """
-Orchestrator — Pure Python threading implementation.
-
-Lit DIRECTEMENT le JSON canvas_nodes / canvas_edges du modèle Workflow.
+Orchestrator — Celery + Redis.
 
 Flux :
   canvas_nodes / canvas_edges (JSON brut)
@@ -11,12 +9,10 @@ Flux :
       → NodeExecution (DB) mis à jour à chaque étape
       → frontend poll /status/ toutes les 2s → NodeExecution
 
-Corrections v2 :
-  - Suppression des time.sleep() visuels (le polling 2s suffit)
-  - workflow.status n'est PLUS modifié ici (statut de définition, pas d'exécution)
-  - Execution.resume_from_node_id stocké à chaque suspension
-  - SuspendExecution dans les branches parallèles → WAITING (pas FAILED)
-  - Statut CANCELLED vérifié à chaque étape
+Exécution asynchrone :
+  - launch_execution_async() envoie une tâche Celery (Redis broker)
+  - Le worker Celery exécute _run_workflow() en arrière-plan
+  - threading reste utilisé UNIQUEMENT pour les branches parallèles (Fork/Join)
 """
 import logging
 import threading
@@ -686,20 +682,37 @@ def _run_workflow(execution_id: int):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Tâche Celery — unité de travail envoyée au worker Redis
+# ═════════════════════════════════════════════════════════════════════════════
+
+from celery import shared_task
+
+@shared_task(
+    bind=True,
+    name='workflows.run_workflow',
+    max_retries=0,          # pas de retry automatique — la logique métier gère les échecs
+    ignore_result=True,     # on ne lit pas le résultat Celery (DB = source de vérité)
+    acks_late=True,         # acquitter après exécution (fiabilité si worker crashe)
+)
+def run_workflow_task(self, execution_id: int):
+    """
+    Tâche Celery — exécute un workflow complet.
+    Appelée par launch_execution_async() et resume_after_approval().
+    """
+    logger.info(f'[Celery] Tâche run_workflow_task démarrée — execution_id={execution_id}  task_id={self.request.id}')
+    _run_workflow(execution_id)
+    logger.info(f'[Celery] Tâche run_workflow_task terminée — execution_id={execution_id}')
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # API publique — appelée depuis views.py
 # ═════════════════════════════════════════════════════════════════════════════
 
 def launch_execution_async(execution_id: int):
-    """Lance l'orchestrateur dans un thread daemon (sans Celery)."""
-    thread = threading.Thread(
-        target=_run_workflow,
-        args=(execution_id,),
-        name=f'wf-execution-{execution_id}',
-        daemon=True,
-    )
-    thread.start()
-    logger.info(f'[Orchestrator] Exécution #{execution_id} lancée dans {thread.name}')
-    return thread
+    """Envoie l'exécution du workflow à Celery (Redis broker)."""
+    task = run_workflow_task.delay(execution_id)
+    logger.info(f'[Orchestrator] Exécution #{execution_id} envoyée à Celery — task_id={task.id}')
+    return task
 
 
 def resume_after_approval(execution_id: int):
@@ -707,14 +720,14 @@ def resume_after_approval(execution_id: int):
     Reprend un workflow PAUSED après approbation ou soumission de formulaire.
     L'orchestrateur saute les nœuds déjà à DONE/SKIPPED.
     """
-    logger.info(f'[Orchestrator] Reprise de l\'exécution #{execution_id}')
+    logger.info(f'[Orchestrator] Reprise de l\'exécution #{execution_id} via Celery')
     launch_execution_async(execution_id)
 
 
 def cancel_execution(execution_id: int) -> bool:
     """
     Annule une exécution en cours ou en pause.
-    Le thread courant détectera CANCELLED à sa prochaine vérification.
+    Le worker Celery détectera CANCELLED à sa prochaine vérification entre nœuds.
     Retourne True si l'annulation a été enregistrée.
     """
     from .models import Execution
