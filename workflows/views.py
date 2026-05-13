@@ -214,15 +214,6 @@ def approve_node(request, execution_id, node_id):
       - ALL  : required_count approbations nécessaires
       - Un REJECTED bloque immédiatement le workflow
     """
-    execution = get_object_or_404(Execution, pk=execution_id)
-    node_exec = get_object_or_404(NodeExecution, execution=execution, node_id=node_id)
-
-    if node_exec.status not in ('WAITING',):
-        return Response(
-            {'error': f'Ce nœud n\'est pas en attente d\'approbation (statut: {node_exec.status})'},
-            status=status.HTTP_409_CONFLICT,
-        )
-
     decision       = request.data.get('decision', 'APPROVED').upper()
     approver_email = request.data.get('approver_email', '')
     comment        = request.data.get('comment', '')
@@ -235,67 +226,87 @@ def approve_node(request, execution_id, node_id):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    # Créer l'enregistrement d'approbation (ForeignKey → plusieurs approbateurs possibles)
-    Approval.objects.create(
-        node_execution=node_exec,
-        decision=decision,
-        approver_email=approver_email,
-        comment=comment,
-        required_count=required_count,
-        approval_type=approval_type,
-    )
+    # ── Fix race condition — select_for_update() verrouille la ligne Execution ──
+    # Si deux approbateurs cliquent simultanément en mode ANY, un seul thread
+    # entre dans le bloc atomique et lance Celery ; le second trouve node_exec.status='DONE'
+    # et retourne 409 immédiatement.
+    from django.db import transaction
 
-    # Évaluer la règle d'approbation
-    gate_passed = Approval.is_gate_passed(node_exec)
-    has_rejection = node_exec.approvals.filter(decision='REJECTED').exists()
+    with transaction.atomic():
+        # Verrouiller l'Execution pour éviter deux lancements simultanés
+        execution = Execution.objects.select_for_update().get(pk=execution_id)
+        node_exec = get_object_or_404(NodeExecution, execution=execution, node_id=node_id)
 
-    # Enrichir les outputs du nœud
-    approved_emails = list(
-        node_exec.approvals.filter(decision='APPROVED').values_list('approver_email', flat=True)
-    )
-    outputs = node_exec.outputs or {}
-    outputs.update({
-        'approval_decision':  decision,
-        'approver_email':     approver_email,
-        'comment':            comment,
-        'approved_by':        approved_emails,
-        'approval_type':      approval_type,
-    })
-    node_exec.outputs = outputs
+        if node_exec.status not in ('WAITING',):
+            return Response(
+                {'error': f'Ce nœud n\'est pas en attente d\'approbation (statut: {node_exec.status})'},
+                status=status.HTTP_409_CONFLICT,
+            )
 
-    if has_rejection:
-        # Rejet → workflow arrêté
-        node_exec.status        = 'FAILED'
-        node_exec.error_message = f'Rejeté par {approver_email}: {comment}'
-        node_exec.save(update_fields=['status', 'outputs', 'error_message'])
+        # Créer l'enregistrement d'approbation
+        Approval.objects.create(
+            node_execution=node_exec,
+            decision=decision,
+            approver_email=approver_email,
+            comment=comment,
+            required_count=required_count,
+            approval_type=approval_type,
+        )
 
-        execution.status        = 'FAILED'
-        execution.error_message = f'Nœud "{node_exec.label}" rejeté par {approver_email}'
-        execution.save(update_fields=['status', 'error_message'])
+        # Évaluer la règle d'approbation
+        gate_passed   = Approval.is_gate_passed(node_exec)
+        has_rejection = node_exec.approvals.filter(decision='REJECTED').exists()
 
-        _log_audit(execution, 'NODE_REJECTED', {
-            'node': node_exec.label, 'approver': approver_email, 'comment': comment,
+        # Enrichir les outputs du nœud
+        approved_emails = list(
+            node_exec.approvals.filter(decision='APPROVED').values_list('approver_email', flat=True)
+        )
+        outputs = node_exec.outputs or {}
+        outputs.update({
+            'approval_decision': decision,
+            'approver_email':    approver_email,
+            'comment':           comment,
+            'approved_by':       approved_emails,
+            'approval_type':     approval_type,
         })
-        return Response({'message': 'Nœud rejeté. Exécution arrêtée.', 'gate_passed': False})
+        node_exec.outputs = outputs
 
-    if gate_passed:
-        # Règle satisfaite → reprendre
-        node_exec.status = 'DONE'
-        node_exec.save(update_fields=['status', 'outputs'])
+        if has_rejection:
+            node_exec.status        = 'FAILED'
+            node_exec.error_message = f'Rejeté par {approver_email}: {comment}'
+            node_exec.save(update_fields=['status', 'outputs', 'error_message'])
 
-        context = execution.context or {}
-        context.update(outputs)
-        execution.status              = 'RUNNING'
-        execution.context             = context
-        execution.resume_from_node_id = ''
-        execution.save(update_fields=['status', 'context', 'resume_from_node_id'])
+            execution.status        = 'FAILED'
+            execution.error_message = f'Nœud "{node_exec.label}" rejeté par {approver_email}'
+            execution.save(update_fields=['status', 'error_message'])
 
+            _log_audit(execution, 'NODE_REJECTED', {
+                'node': node_exec.label, 'approver': approver_email, 'comment': comment,
+            })
+            return Response({'message': 'Nœud rejeté. Exécution arrêtée.', 'gate_passed': False})
+
+        if gate_passed:
+            # Marquer DONE avant de sortir du bloc atomique → le second thread verra DONE
+            node_exec.status = 'DONE'
+            node_exec.save(update_fields=['status', 'outputs'])
+
+            ctx = execution.context or {}
+            ctx.update(outputs)
+            execution.status              = 'RUNNING'
+            execution.context             = ctx
+            execution.resume_from_node_id = ''
+            execution.save(update_fields=['status', 'context', 'resume_from_node_id'])
+
+            _log_audit(execution, 'NODE_APPROVED', {
+                'node': node_exec.label, 'approver': approver_email,
+                'approved_count': len(approved_emails),
+            })
+
+        # ── Lancer Celery EN DEHORS du bloc atomic pour éviter un deadlock ──
+        # (Celery essaierait de lire l'Execution avant que la transaction ne soit commitée)
+
+    if gate_passed and not has_rejection:
         resume_after_approval(execution.id)
-
-        _log_audit(execution, 'NODE_APPROVED', {
-            'node': node_exec.label, 'approver': approver_email,
-            'approved_count': len(approved_emails),
-        })
         return Response({
             'message':     f'Nœud approuvé. Reprise de l\'exécution #{execution.id}.',
             'gate_passed': True,

@@ -411,9 +411,16 @@ def _run_workflow(execution_id: int):
         execution = Execution.objects.get(pk=execution_id)
         workflow  = execution.workflow
 
-        # Ne pas relancer si déjà annulé
-        if execution.status == 'CANCELLED':
-            logger.info(f'[Orchestrator] Exécution #{execution_id} annulée — abandon.')
+        # ── Fix idempotence — guard contre le rejeu Celery (acks_late + Redis AOF) ──
+        # Avec acks_late=True, si le worker crashe après avoir démarré la tâche mais
+        # avant d'acquitter, Celery remet la tâche dans la file au redémarrage.
+        # Si l'exécution est déjà dans un état terminal, on sort immédiatement.
+        TERMINAL_STATES = {'SUCCESS', 'FAILED', 'CANCELLED'}
+        if execution.status in TERMINAL_STATES:
+            logger.warning(
+                f'[Orchestrator] Exécution #{execution_id} déjà en état terminal '
+                f'"{execution.status}" — tâche Celery ignorée (rejeu détecté).'
+            )
             return
 
         execution.status = 'RUNNING'
