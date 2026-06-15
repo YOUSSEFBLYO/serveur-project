@@ -344,6 +344,11 @@ def _execute_parallel_branches(
         with lock:
             branch_contexts[idx] = local_ctx
 
+    # Timeout maximum par branche parallèle (5 minutes).
+    # Empêche un thread bloqué (exception non catchée, timeout réseau…)
+    # de geler indéfiniment le worker Celery.
+    BRANCH_TIMEOUT = 300
+
     threads = [
         threading.Thread(
             target=run_branch,
@@ -356,7 +361,28 @@ def _execute_parallel_branches(
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(timeout=BRANCH_TIMEOUT)
+        if t.is_alive():
+            logger.error(
+                f'[Parallel] Thread {t.name} toujours actif après {BRANCH_TIMEOUT}s '
+                f'— branche probablement bloquée. Le workflow continuera sans elle.'
+            )
+            # Retrouver l\'index de la branche à partir du nom du thread
+            try:
+                branch_idx = int(t.name.split('-')[-1])
+                branch_nodes = branch_node_lists[branch_idx]
+                for bn in branch_nodes:
+                    if bn.status == 'RUNNING':
+                        bn.status        = 'FAILED'
+                        bn.error_message = f'Timeout: branche bloquée après {BRANCH_TIMEOUT}s'
+                        ne = node_exec_map.get(bn.node_id)
+                        if ne:
+                            ne.status        = 'FAILED'
+                            ne.error_message = bn.error_message
+                            ne.finished_at   = datetime.now(timezone.utc)
+                            ne.save(update_fields=['status', 'error_message', 'finished_at'])
+            except (ValueError, IndexError) as parse_err:
+                logger.warning(f'[Parallel] Impossible de déterminer l\'index de branche: {parse_err}')
 
     for bctx in branch_contexts:
         context.update(bctx)
@@ -551,22 +577,31 @@ def _run_workflow(execution_id: int):
                         f'(handle actif: "{active_handle}")'
                     )
 
+                    # BUG FIX — comparaison STRICTE sur sourceHandle.
+                    # L\'ancienne version utilisait `not e.sourceHandle` ce qui
+                    # faisait glisser les arêtes sans handle dans la branche active,
+                    # et empêchait leur skip correct côté inactif.
                     active_targets = [
                         e.target for e in edges
                         if e.source == node_id
-                        and (not e.sourceHandle or e.sourceHandle == active_handle)
+                        and e.sourceHandle == active_handle   # strict : "true" ou "false"
                     ]
+                    inactive_targets = [
+                        e.target for e in edges
+                        if e.source == node_id
+                        and e.sourceHandle == inactive_handle
+                    ]
+
                     protected = set()
                     for t in active_targets:
                         protected |= _reachable_from(t, edges)
 
-                    for edge in edges:
-                        if edge.source == node_id and edge.sourceHandle == inactive_handle:
-                            _skip_downstream(
-                                edge.target, edges, node_map,
-                                node_exec_map, ordered_ids,
-                                protected=protected,
-                            )
+                    for target in inactive_targets:
+                        _skip_downstream(
+                            target, edges, node_map,
+                            node_exec_map, ordered_ids,
+                            protected=protected,
+                        )
 
                 # ── Switch multi-branches ─────────────────────────────────
                 elif node.node_type == 'switch':

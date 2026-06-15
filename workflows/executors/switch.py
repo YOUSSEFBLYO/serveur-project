@@ -23,7 +23,6 @@ Config du nœud :
 """
 import json
 import logging
-import time
 
 from .base import BaseExecutor
 
@@ -89,8 +88,6 @@ class SwitchExecutor(BaseExecutor):
             f'→ Valeur résolue: "{matched}"  '
             f'(branches disponibles: {handles})'
         )
-
-        time.sleep(0.3)
 
         return {
             'switch_expression':     expression,

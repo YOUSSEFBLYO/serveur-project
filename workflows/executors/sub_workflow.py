@@ -21,13 +21,10 @@ Config du nœud :
 """
 import json
 import logging
-import time
 
 from .base import BaseExecutor
 
 logger = logging.getLogger(__name__)
-
-POLL_INTERVAL = 3   # secondes entre chaque poll
 
 
 class SubWorkflowExecutor(BaseExecutor):
@@ -39,7 +36,6 @@ class SubWorkflowExecutor(BaseExecutor):
         workflow_id_raw = self.cfg('workflowId', '').strip()
         context_pass    = self.cfg('contextPass', '{}').strip()
         output_prefix   = self.cfg('outputPrefix', 'sub_').strip() or 'sub_'
-        timeout         = int(self.cfg('timeout', '300') or '300')
         fail_on_error   = bool(self.cfg('failOnError', True))
 
         if not workflow_id_raw:
@@ -92,42 +88,33 @@ class SubWorkflowExecutor(BaseExecutor):
             context=sub_context,
         )
 
-        # Import de l'orchestrateur (evite import circulaire)
-        from workflows.orchestrator import launch_execution_async
-        launch_execution_async(sub_execution.id)
+        # ── Exécution directe (synchrone) — évite le deadlock pool=solo ─────
+        # Avec pool=solo, launch_execution_async() enqueue dans Celery mais le
+        # worker est déjà occupé → le sous-workflow ne démarre jamais (deadlock).
+        # On appelle _run_workflow() directement dans le même thread.
+        from workflows.orchestrator import _run_workflow
+        _run_workflow(sub_execution.id)
 
-        # ── Polling jusqu'à complétion ────────────────────────────────────────
-        elapsed   = 0
-        final_status = 'UNKNOWN'
+        # Lire le statut final après exécution synchrone
+        sub_execution.refresh_from_db()
+        final_status = sub_execution.status
+
+        # Gérer le cas PAUSED (Human Task dans le sous-workflow)
+        if final_status == 'PAUSED':
+            raise RuntimeError(
+                f"[SubWorkflow] Le sous-workflow #{workflow_id} est suspendu "
+                f"sur une tâche humaine — les sous-workflows avec Human Task "
+                f"ne sont pas supportés en mode synchrone."
+            )
+
+        if final_status == 'CANCELLED':
+            raise RuntimeError(
+                f"[SubWorkflow] Le sous-workflow #{workflow_id} a été annulé."
+            )
 
         logger.info(
-            f'[SubWorkflow] Polling exécution #{sub_execution.id} '
-            f'(timeout={timeout}s, poll toutes les {POLL_INTERVAL}s)'
+            f'[SubWorkflow] Exécution #{sub_execution.id} terminée — statut: {final_status}'
         )
-
-        while elapsed < timeout:
-            time.sleep(POLL_INTERVAL)
-            elapsed += POLL_INTERVAL
-
-            # Rafraîchir depuis la DB
-            sub_execution.refresh_from_db()
-            final_status = sub_execution.status
-
-            logger.info(
-                f'[SubWorkflow] Exécution #{sub_execution.id} — '
-                f'statut: {final_status}  ({elapsed}s écoulés)'
-            )
-
-            if final_status in ('SUCCESS', 'FAILED'):
-                break
-
-        else:
-            # Timeout atteint
-            raise RuntimeError(
-                f"[SubWorkflow] Timeout ({timeout}s) atteint — "
-                f"Workflow #{workflow_id} toujours en {sub_execution.status}.\n"
-                f"Augmentez le timeout ou vérifiez le sous-workflow."
-            )
 
         # ── Collecter les sorties du sous-workflow ────────────────────────────
         sub_outputs: dict = {}

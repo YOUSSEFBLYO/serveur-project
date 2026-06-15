@@ -1,5 +1,5 @@
 """
-Registre des exécuteurs — 7 nœuds canoniques + 3 avancés.
+Registre des exécuteurs — 7 nœuds canoniques + 3 avancés + 3 AIOps.
 
   trigger        → TriggerExecutor         (manual | webhook | cron | git)
   http_request   → HttpRequestExecutor     (tout appel API REST)
@@ -12,6 +12,11 @@ Registre des exécuteurs — 7 nœuds canoniques + 3 avancés.
   parallel_join  → ParallelJoinExecutor    (AND-join)
   switch         → SwitchExecutor          (multi-branches)
   sub_workflow   → SubWorkflowExecutor     (call activity)
+
+  ── AIOps ──────────────────────────────────────────────────────────
+  aiops.ElasticsearchFetch → ElasticsearchFetchExecutor  (récupère logs ES)
+  aiops.LogClassifier      → LogClassifierExecutor       (agent IA classification)
+  aiops.ReportGenerator    → ReportGeneratorExecutor     (rapport HTML/MD/text)
 """
 
 from .base          import BaseExecutor, StaticExecutor
@@ -26,6 +31,12 @@ from .parallel_fork import ParallelForkExecutor
 from .parallel_join import ParallelJoinExecutor
 from .switch        import SwitchExecutor
 from .sub_workflow  import SubWorkflowExecutor
+from .set_variable  import SetVariableExecutor
+
+# ── AIOps ────────────────────────────────────────────────────────────────────
+from .aiops_elasticsearch   import ElasticsearchFetchExecutor
+from .aiops_log_classifier  import LogClassifierExecutor
+from .aiops_report_generator import ReportGeneratorExecutor
 
 _REGISTRY: dict[str, type[BaseExecutor]] = {
     'trigger':         TriggerExecutor,
@@ -39,6 +50,11 @@ _REGISTRY: dict[str, type[BaseExecutor]] = {
     'parallel_join':   ParallelJoinExecutor,
     'switch':          SwitchExecutor,
     'sub_workflow':    SubWorkflowExecutor,
+    'set_variable':    SetVariableExecutor,
+    # ── AIOps ────────────────────────────────────────────────────────
+    'aiops.ElasticsearchFetch': ElasticsearchFetchExecutor,
+    'aiops.LogClassifier':      LogClassifierExecutor,
+    'aiops.ReportGenerator':    ReportGeneratorExecutor,
 }
 
 

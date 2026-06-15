@@ -13,7 +13,6 @@ Config du nœud :
     (aucune config requise — la topologie des arêtes définit les branches)
 """
 import logging
-import time
 
 from .base import BaseExecutor
 
@@ -30,7 +29,6 @@ class ParallelForkExecutor(BaseExecutor):
     def run(self) -> dict:
         label = self.node.label or 'Fork Parallèle'
         logger.info(f'[ParallelFork] "{label}" — déclenchement exécution parallèle')
-        time.sleep(0.3)
         return {
             'parallel_fork':  True,
             'fork_label':     label,

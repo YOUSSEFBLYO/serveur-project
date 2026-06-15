@@ -18,7 +18,6 @@ Config du nœud :
     inputParams    : str   — JSON de paramètres additionnels
 """
 import logging
-import time
 
 from .base import BaseExecutor
 
@@ -63,8 +62,6 @@ class TriggerExecutor(BaseExecutor):
         )
 
         logger.info(f'[Trigger/Manual] Déclenché par {triggered_by}')
-        time.sleep(0.3)
-
         return {
             'trigger_type': 'manual',
             'triggered_by': triggered_by,
@@ -76,9 +73,7 @@ class TriggerExecutor(BaseExecutor):
         allowed_ips = self.cfg('allowed_ips', '').strip()
         payload     = self.ctx('webhook_payload', {})
 
-        logger.info(f'[Trigger/Webhook] secret={"✓" if secret else "non"}  ips={allowed_ips or "all"}')
-        time.sleep(0.3)
-
+        logger.info(f'[Trigger/Webhook] secret={"oui" if secret else "non"}  ips={allowed_ips or "all"}')
         return {
             'trigger_type':    'webhook',
             'webhook_payload': payload,
@@ -94,8 +89,6 @@ class TriggerExecutor(BaseExecutor):
         timezone = self.cfg('timezone', 'Africa/Casablanca').strip()
 
         logger.info(f'[Trigger/Cron] Expression: {cron_expr}  tz={timezone}')
-        time.sleep(0.3)
-
         return {
             'trigger_type':    'cron',
             'cron_expression': cron_expr,
@@ -115,8 +108,6 @@ class TriggerExecutor(BaseExecutor):
         )
 
         logger.info(f'[Trigger/Git] {event_type} → branche "{branch_filter}"')
-        time.sleep(0.3)
-
         return {
             'trigger_type':   'git',
             'trigger_event':  event_type,

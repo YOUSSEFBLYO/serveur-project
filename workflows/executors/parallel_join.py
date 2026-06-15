@@ -13,7 +13,6 @@ Config du nœud :
     (aucune config requise — la topologie des arêtes définit la convergence)
 """
 import logging
-import time
 
 from .base import BaseExecutor
 
@@ -30,7 +29,6 @@ class ParallelJoinExecutor(BaseExecutor):
     def run(self) -> dict:
         label = self.node.label or 'Join Parallèle'
         logger.info(f'[ParallelJoin] "{label}" — toutes les branches convergées')
-        time.sleep(0.3)
         return {
             'parallel_join': True,
             'join_label':    label,

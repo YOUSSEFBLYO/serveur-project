@@ -19,13 +19,13 @@ class Workflow(models.Model):
     ]
 
     TYPE_CHOICES = [
-        ('Mises en production',          'Mises en production'),
-        ('Onboarding applicatif',        'Onboarding applicatif'),
-        ('Gestion des incidents majeurs','Gestion des incidents majeurs'),
-        ('Validation sécurité',          'Validation sécurité'),
-        ('Ouverture de flux',            'Ouverture de flux'),
-        ('Gouvernance des changements',  'Gouvernance des changements'),
-        ('Workflow métier custom',       'Workflow métier custom'),
+        ('Déploiement', 'Déploiement'),
+        ('Onboarding',  'Onboarding'),
+        ('Incident',    'Incident'),
+        ('Sécurité',    'Sécurité'),
+        ('Réseau',      'Réseau'),
+        ('CAB',         'CAB'),
+        ('Métier',      'Métier'),
     ]
 
     PRIORITY_CHOICES = [
@@ -37,7 +37,7 @@ class Workflow(models.Model):
 
     name          = models.CharField(max_length=255)
     description   = models.TextField(blank=True, default='')
-    workflow_type = models.CharField(max_length=100, choices=TYPE_CHOICES, default='Mises en production')
+    workflow_type = models.CharField(max_length=100, choices=TYPE_CHOICES, default='Déploiement')
     priority      = models.CharField(max_length=20, choices=PRIORITY_CHOICES, default='MEDIUM')
     creator_name  = models.CharField(max_length=255, default='Admin')
 
