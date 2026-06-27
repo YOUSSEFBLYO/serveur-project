@@ -555,7 +555,8 @@ def _run_workflow(execution_id: int):
                         first = suspended_info[0]
                         execution.resume_from_node_id = first['node_id']
                         execution.status = 'PAUSED'
-                        execution.save(update_fields=['status', 'resume_from_node_id'])
+                        execution.context = context
+                        execution.save(update_fields=['status', 'resume_from_node_id', 'context'])
 
                         _log_event(execution, 'EXECUTION_PAUSED', {
                             'reason': 'Branche parallèle suspendue',
@@ -645,7 +646,8 @@ def _run_workflow(execution_id: int):
                 # [FIX] Stocker le node_id de reprise dans l'exécution
                 execution.resume_from_node_id = node_id
                 execution.status = 'PAUSED'
-                execution.save(update_fields=['status', 'resume_from_node_id'])
+                execution.context = context
+                execution.save(update_fields=['status', 'resume_from_node_id', 'context'])
 
                 _log_event(execution, 'NODE_SUSPENDED', {
                     'node':   node.label,
@@ -673,6 +675,10 @@ def _run_workflow(execution_id: int):
                 node_exec.finished_at   = finished
                 node_exec.save(update_fields=['status', 'outputs', 'error_message', 'finished_at'])
 
+            # Sauvegarde du contexte en DB après chaque nœud pour éviter les pertes sur crash
+            execution.context = context
+            execution.save(update_fields=['context'])
+
             _log_event(execution, f'NODE_{node.status}', {
                 'node':    node.label,
                 'type':    node.node_type,
@@ -698,8 +704,9 @@ def _run_workflow(execution_id: int):
             execution.error_message = ' | '.join(
                 f'{n.label}: {n.error_message}' for n in failed_nodes
             )
+        execution.context             = context
         execution.save(update_fields=[
-            'status', 'finished_at', 'resume_from_node_id', 'error_message'
+            'status', 'finished_at', 'resume_from_node_id', 'error_message', 'context'
         ])
 
         _log_event(execution, 'EXECUTION_COMPLETE', {'status': final_status})

@@ -4,6 +4,7 @@ django-cors-headers
 python-decouple
 celery[redis]>=5.3
 redis>=5.0
-d r f - y a s g  
+drf-yasg  
 croniter>=1.4.0  
- 
+openai
+xhtml2pdf>=0.2.11     # Conversion HTML → PDF pour les rapports email (Outlook)

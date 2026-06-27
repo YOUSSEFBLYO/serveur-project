@@ -1,32 +1,18 @@
 """
-AIOps — Log Classifier (nœud aiops.LogClassifier)
+AIOps — Log Classifier avec agrégations
+nœud aiops.LogClassifier
 
-Agent IA qui reçoit les logs bruts depuis le contexte (produit par ElasticsearchFetch)
-et les classifie par niveau de sévérité, détecte les anomalies, et produit un résumé
-structuré pour le nœud suivant (ReportGenerator ou Notification).
-
-Providers IA supportés :
-    openai   → API OpenAI (GPT-4o, GPT-4o-mini, GPT-3.5-turbo …)
-    gemini   → Google Gemini API (gemini-1.5-flash, gemini-1.5-pro …)
-    ollama   → Serveur Ollama local (llama3, mistral …) — aucune clé API requise
-
-Config du nœud (canvas React Flow) :
-    ai_provider    : str  — openai | gemini | ollama  (défaut: openai)
-    ai_model       : str  — Nom du modèle             (défaut: gpt-4o-mini)
-    api_key        : str  — Clé API (supporte {{MA_VAR}})
-    api_base_url   : str  — URL de base (seulement pour ollama/custom)
-                            ex: http://localhost:11434/api
-    input_key      : str  — Clé contexte contenant les logs  (défaut: es_logs)
-    max_logs       : int  — Nombre max de logs envoyés à l'IA (défaut: 50)
-    custom_prompt  : str  — Instruction additionnelle à ajouter au prompt système
-    language       : str  — Langue du rapport IA  fr | en  (défaut: fr)
-    output_key     : str  — Clé de sortie  (défaut: ai_analysis)
+CHANGEMENTS vs version originale :
+  - Lit es_aggregated depuis le contexte (priorité sur es_logs bruts)
+  - Prompt enrichi avec les statistiques agrégées (100% de couverture)
+  - Fallback sur logs bruts si pas d'agrégation disponible
+  - user_message construit depuis le résumé agrégé
 """
 import json
 import logging
 import re
-from urllib.request import urlopen, Request
-from urllib.error import URLError, HTTPError
+
+import openai
 
 from .base import BaseExecutor
 
@@ -34,7 +20,6 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_vars(text: str, context: dict) -> str:
-    """Remplace {{key}} par la valeur du contexte d'exécution."""
     if not text:
         return text or ''
     for key, value in context.items():
@@ -42,15 +27,12 @@ def _resolve_vars(text: str, context: dict) -> str:
     return text
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Prompt système — instruit l'IA sur le format de réponse attendu
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ── Prompt système FR ─────────────────────────────────────────────────────────
 _SYSTEM_PROMPT_FR = """Tu es un expert en analyse de logs applicatifs et en opérations (AIOps).
-On te fournit une liste de logs bruts au format JSON.
 
-Ta tâche est d'analyser ces logs et de répondre UNIQUEMENT avec un objet JSON valide
-ayant EXACTEMENT la structure suivante (sans markdown, sans backticks, sans explication) :
+Ta tâche est d'analyser les statistiques de logs fournies et de répondre
+UNIQUEMENT avec un objet JSON valide ayant EXACTEMENT cette structure
+(sans markdown, sans backticks, sans explication) :
 
 {
   "summary": "Résumé en 2-3 phrases de l'état général du système",
@@ -62,8 +44,8 @@ ayant EXACTEMENT la structure suivante (sans markdown, sans backticks, sans expl
     {
       "severity": "CRITICAL|ERROR|WARNING",
       "description": "Description de l'anomalie détectée",
-      "affected_service": "Nom du service",
-      "first_occurrence": "timestamp ISO",
+      "affected_service": "Nom du service concerné",
+      "first_occurrence": "timestamp ISO ou période",
       "count": 1,
       "recommendation": "Action recommandée"
     }
@@ -77,20 +59,19 @@ ayant EXACTEMENT la structure suivante (sans markdown, sans backticks, sans expl
   ],
   "overall_health": "HEALTHY|DEGRADED|CRITICAL",
   "needs_immediate_action": false,
-  "immediate_actions": ["Action 1 si urgence", "Action 2"]
+  "immediate_actions": ["Action 1 si urgent", "Action 2"]
 }
 
-Règles :
-- Classe chaque log dans l'un des niveaux : CRITICAL, ERROR, WARNING, INFO
-- Détecte les patterns répétitifs qui signalent une anomalie
-- Si aucune anomalie : anomalies = [], top_errors = []
-- Sois précis et concis dans les descriptions
+Règles de classification de la sévérité :
+- CRITICAL : overall_health=CRITICAL si critical_count > 0 ou error_count > 50
+- DEGRADED : overall_health=DEGRADED si error_count > 0 ou warning_count > 20
+- HEALTHY  : overall_health=HEALTHY sinon
+- needs_immediate_action=true seulement si CRITICAL
 """
 
 _SYSTEM_PROMPT_EN = """You are an expert in application log analysis and AIOps.
-You receive a list of raw logs in JSON format.
 
-Your task is to analyze these logs and respond ONLY with a valid JSON object
+Analyze the provided log statistics and respond ONLY with a valid JSON object
 having EXACTLY this structure (no markdown, no backticks, no explanation):
 
 {
@@ -104,7 +85,7 @@ having EXACTLY this structure (no markdown, no backticks, no explanation):
       "severity": "CRITICAL|ERROR|WARNING",
       "description": "Description of the detected anomaly",
       "affected_service": "Service name",
-      "first_occurrence": "ISO timestamp",
+      "first_occurrence": "ISO timestamp or period",
       "count": 1,
       "recommendation": "Recommended action"
     }
@@ -118,7 +99,7 @@ having EXACTLY this structure (no markdown, no backticks, no explanation):
   ],
   "overall_health": "HEALTHY|DEGRADED|CRITICAL",
   "needs_immediate_action": false,
-  "immediate_actions": ["Action 1 if urgent", "Action 2"]
+  "immediate_actions": ["Action 1 if urgent"]
 }
 """
 
@@ -127,254 +108,317 @@ class LogClassifierExecutor(BaseExecutor):
     """
     Agent IA de classification de logs.
 
-    Reçoit les logs depuis le contexte (produit par ElasticsearchFetchExecutor),
-    construit un prompt structuré, appelle l'API IA choisie et retourne
-    une analyse complète (comptages, anomalies, santé globale) dans le contexte.
+    NOUVEAU : utilise en priorité es_aggregated (résumé statistique
+    couvrant 100% des logs) au lieu des logs bruts limités à max_logs.
+    Fallback sur les logs bruts si pas d'agrégation disponible.
     """
 
     def run(self) -> dict:
         # ── Paramètres ────────────────────────────────────────────────────────
-        ai_provider = (self.cfg('ai_provider', 'openai') or 'openai').strip().lower()
-        ai_model    = (self.cfg('ai_model', '')          or '').strip()
-        api_key     = _resolve_vars(
-            (self.cfg('api_key', '') or '').strip(), self.context
-        )
-        api_base_url = _resolve_vars(
-            (self.cfg('api_base_url', '') or '').strip(), self.context
-        )
-        input_key    = (self.cfg('input_key', 'es_logs') or 'es_logs').strip()
-        max_logs     = int(self.cfg('max_logs', 50) or 50)
-        language     = (self.cfg('language', 'fr') or 'fr').strip().lower()
-        output_key   = (self.cfg('output_key', 'ai_analysis') or 'ai_analysis').strip()
-        custom_prompt = (self.cfg('custom_prompt', '') or '').strip()
+        ai_model      = (self.cfg('ai_model',     '')        or '').strip()
+        api_key       = _resolve_vars((self.cfg('api_key',      '') or '').strip(), self.context)
+        api_base_url  = _resolve_vars((self.cfg('api_base_url', '') or '').strip(), self.context)
+        input_key     = (self.cfg('input_key',  'es_logs')   or 'es_logs').strip()
+        max_logs      = int(self.cfg('max_logs', 50)         or 50)
+        language      = (self.cfg('language',   'fr')        or 'fr').strip().lower()
+        output_key    = (self.cfg('output_key', 'ai_analysis') or 'ai_analysis').strip()
+        custom_prompt = (self.cfg('custom_prompt', '')       or '').strip()
 
-        # ── Récupération des logs depuis le contexte ──────────────────────────
-        logs = self.context.get(input_key, [])
-        if not logs:
-            logger.warning(
-                f'[LogClassifier] Aucun log trouvé dans le contexte '
-                f'(clé: "{input_key}") — analyse ignorée.'
+        # ── NOUVEAU : Priorité aux agrégations ────────────────────────────────
+        aggregated = self.context.get('es_aggregated')
+        logs       = self.context.get(input_key, [])
+
+        if aggregated:
+            # Cas 1 : agrégations disponibles → couverture 100% des logs
+            user_message, logs_analyzed = self._build_message_from_aggs(aggregated)
+            source = 'aggregated'
+            logger.info(
+                f'[LogClassifier] Mode agrégations — '
+                f'{aggregated.get("total_logs", 0)} logs couverts via stats ES'
             )
-            return {
-                output_key: {
-                    'summary': 'Aucun log à analyser.',
-                    'overall_health': 'HEALTHY',
-                    'critical_count': 0, 'error_count': 0,
-                    'warning_count': 0,  'info_count': 0,
-                    'anomalies': [], 'top_errors': [],
-                    'needs_immediate_action': False,
-                    'immediate_actions': [],
-                },
-                'ai_logs_analyzed': 0,
-                'ai_provider': ai_provider,
-            }
 
-        # Limite au nombre max de logs
-        logs_to_analyze = logs[:max_logs]
-        logs_json = json.dumps(logs_to_analyze, ensure_ascii=False, indent=None)
+        elif logs:
+            # Cas 2 : fallback sur logs bruts (ancienne méthode)
+            logs_to_analyze = logs[:max_logs]
+            logs_json       = json.dumps(logs_to_analyze, ensure_ascii=False)
+            user_message    = (
+                f"Voici {len(logs_to_analyze)} logs bruts à analyser :\n"
+                f"{logs_json}"
+            )
+            logs_analyzed = len(logs_to_analyze)
+            source = 'raw_logs'
+            logger.warning(
+                '[LogClassifier] Fallback logs bruts — '
+                'pas d\'agrégation disponible (couverture partielle)'
+            )
 
-        logger.info(
-            f'[LogClassifier] Analyse de {len(logs_to_analyze)}/{len(logs)} logs '
-            f'via provider="{ai_provider}" model="{ai_model}"'
-        )
+        else:
+            logger.warning('[LogClassifier] Aucune donnée à analyser')
+            return self._empty_result(output_key)
 
-        # ── Choix du prompt système ───────────────────────────────────────────
+        # ── Prompt système ────────────────────────────────────────────────────
         system_prompt = _SYSTEM_PROMPT_EN if language == 'en' else _SYSTEM_PROMPT_FR
         if custom_prompt:
-            system_prompt += f"\n\nInstruction additionnelle : {custom_prompt}"
+            system_prompt += f"\n\nContexte métier spécifique :\n{custom_prompt}"
 
-        user_message = f"Voici {len(logs_to_analyze)} logs à analyser :\n{logs_json}"
+        logger.info(
+            f'[LogClassifier] Appel LiteLLM — '
+            f'model={ai_model} source={source}'
+        )
 
-        # ── Appel IA selon le provider ────────────────────────────────────────
-        if ai_provider == 'gemini':
-            raw_response = self._call_gemini(
-                api_key, ai_model or 'gemini-1.5-flash',
-                system_prompt, user_message
-            )
-        elif ai_provider == 'ollama':
-            raw_response = self._call_ollama(
-                api_base_url or 'http://localhost:11434',
-                ai_model or 'llama3',
-                system_prompt, user_message
-            )
-        else:
-            # OpenAI (défaut)
-            raw_response = self._call_openai(
-                api_key, ai_model or 'gpt-4o-mini',
-                system_prompt, user_message
-            )
+        # ── Appel LiteLLM ─────────────────────────────────────────────────────
+        raw_response = self._call_litellm(
+            api_key       = api_key,
+            api_base_url  = api_base_url,
+            model         = ai_model or 'gpt-4o-mini',
+            system_prompt = system_prompt,
+            user_message  = user_message,
+        )
 
-        # ── Parsing de la réponse JSON ────────────────────────────────────────
-        analysis = self._parse_ai_response(raw_response, ai_provider)
+        analysis = self._parse_ai_response(raw_response)
 
         logger.info(
             f'[LogClassifier] ✅ Analyse terminée — '
-            f'health={analysis.get("overall_health")}  '
-            f'critical={analysis.get("critical_count")}  '
-            f'errors={analysis.get("error_count")}  '
-            f'warnings={analysis.get("warning_count")}'
+            f'health={analysis.get("overall_health")} '
+            f'errors={analysis.get("error_count")} '
+            f'source={source}'
         )
 
         return {
-            output_key:        analysis,
-            'ai_analysis':     analysis,
-            'ai_logs_analyzed': len(logs_to_analyze),
-            'ai_provider':     ai_provider,
-            'ai_model':        ai_model,
-            'ai_overall_health':    analysis.get('overall_health', 'UNKNOWN'),
-            'ai_needs_action': analysis.get('needs_immediate_action', False),
+            output_key:          analysis,
+            'ai_analysis':       analysis,
+            'ai_logs_analyzed':  logs_analyzed,
+            'ai_source':         source,            # ← NOUVEAU : trace la source
+            'ai_model':          ai_model,
+            'ai_overall_health': analysis.get('overall_health', 'UNKNOWN'),
+            'ai_needs_action':   analysis.get('needs_immediate_action', False),
         }
 
-    # ── Providers ─────────────────────────────────────────────────────────────
+    # ── NOUVEAU : Construction du message depuis les agrégations ──────────────
 
-    def _call_openai(self, api_key: str, model: str,
-                     system_prompt: str, user_message: str) -> str:
+    def _build_message_from_aggs(self, agg: dict) -> tuple:
+        """
+        Construit le message utilisateur depuis le résumé agrégé ES.
+        Couvre 100% des logs en n'envoyant que les statistiques.
+
+        Returns:
+            (user_message: str, logs_analyzed: int)
+        """
+        total      = agg.get('total_logs', 0)
+        period     = agg.get('period', '?')
+        index      = agg.get('index', '?')
+        by_level   = agg.get('by_level', {})
+        top_errors = agg.get('top_error_messages', [])
+        top_pods   = agg.get('most_affected_pods', [])
+        error_rate = agg.get('error_rate_per_min', [])
+        struct_types = agg.get('structured_error_types', [])
+        samples    = agg.get('sample_logs', [])
+
+        # Formatage compact des niveaux
+        levels_str = ' | '.join(
+            f"{k}: {v}"
+            for k, v in sorted(by_level.items(), key=lambda x: -x[1])
+        )
+
+        # Formatage des top erreurs
+        errors_str = '\n'.join(
+            f"  [{i+1}] ×{e['count']} — {e['message'][:120]}"
+            for i, e in enumerate(top_errors[:10])
+        ) or '  Aucune erreur détectée'
+
+        # Formatage des pods impactés
+        pods_str = '\n'.join(
+            f"  - {p['pod']}: {p['errors']} erreurs"
+            for p in top_pods[:5]
+        ) or '  Aucun pod identifié'
+
+        # Formatage des types d'erreurs structurées
+        struct_str = '\n'.join(
+            f"  - {t['type']}: ×{t['count']}"
+            for t in struct_types[:5]
+        ) or '  Aucun type structuré disponible'
+
+        # Pics d'erreurs (minutes avec le plus d'erreurs)
+        peaks = sorted(error_rate, key=lambda x: -x['errors'])[:3]
+        peaks_str = ', '.join(
+            f"{p['minute']} (×{p['errors']})"
+            for p in peaks
+        ) or 'Aucun pic détecté'
+
+        # Exemples de logs bruts
+        samples_str = '\n'.join(
+            f"  [{s.get('level','?')}] {s.get('timestamp','')[:19]} "
+            f"pod={s.get('pod','?')} — {s.get('message','')[:100]}"
+            for s in samples[:3]
+        ) or '  Aucun exemple disponible'
+
+        # Message final
+        message = f"""Analyse ce résumé statistique de logs Elasticsearch.
+
+CONTEXTE :
+  Index   : {index}
+  Période : {period}
+  Total   : {total:,} logs analysés (couverture 100%)
+
+RÉPARTITION PAR NIVEAU :
+  {levels_str}
+
+TOP 10 MESSAGES D'ERREUR (fréquence) :
+{errors_str}
+
+PODS LES PLUS IMPACTÉS :
+{pods_str}
+
+TYPES D'ERREURS STRUCTURÉES (champ structured.error.type) :
+{struct_str}
+
+PICS D'ERREURS (minutes les plus chargées) :
+  {peaks_str}
+
+EXEMPLES DE LOGS BRUTS (3 derniers) :
+{samples_str}
+"""
+        return message, total
+
+    # ── Appel LiteLLM ─────────────────────────────────────────────────────────
+
+    def _call_litellm(self, api_key, api_base_url, model,
+                      system_prompt, user_message) -> str:
+
         if not api_key:
-            raise RuntimeError(
-                "[LogClassifier] provider=openai mais 'api_key' est vide.\n"
-                "Renseignez la clé API OpenAI dans la config du nœud."
-            )
-        payload = json.dumps({
-            "model": model,
-            "messages": [
-                {"role": "system",  "content": system_prompt},
-                {"role": "user",    "content": user_message},
-            ],
-            "temperature":  0.1,
-            "max_tokens":   2000,
-            "response_format": {"type": "json_object"},
-        }).encode('utf-8')
+            raise RuntimeError("[LogClassifier] 'api_key' vide.")
+        if not api_base_url:
+            raise RuntimeError("[LogClassifier] 'api_base_url' vide.")
 
-        req = Request(
-            'https://api.openai.com/v1/chat/completions',
-            data=payload,
-            method='POST',
-            headers={
-                'Content-Type':  'application/json',
-                'Authorization': f'Bearer {api_key}',
-            }
-        )
-        return self._http_call(req, provider='OpenAI')
+        base_url = api_base_url.rstrip('/')
+        logger.info(f'[LogClassifier] LiteLLM → {base_url} model={model}')
 
-    def _call_gemini(self, api_key: str, model: str,
-                     system_prompt: str, user_message: str) -> str:
-        if not api_key:
-            raise RuntimeError(
-                "[LogClassifier] provider=gemini mais 'api_key' est vide.\n"
-                "Renseignez la clé API Google AI Studio dans la config du nœud."
-            )
-        url = (
-            f'https://generativelanguage.googleapis.com/v1beta/models/'
-            f'{model}:generateContent?key={api_key}'
-        )
-        payload = json.dumps({
-            "system_instruction": {"parts": [{"text": system_prompt}]},
-            "contents": [{"parts": [{"text": user_message}]}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 2000,
-                "responseMimeType": "application/json",
-            },
-        }).encode('utf-8')
+        import os
+        from urllib.parse import urlparse
 
-        req = Request(
-            url, data=payload, method='POST',
-            headers={'Content-Type': 'application/json'}
-        )
-        return self._http_call(req, provider='Gemini')
-
-    def _call_ollama(self, base_url: str, model: str,
-                     system_prompt: str, user_message: str) -> str:
-        """Appelle un serveur Ollama local (aucune clé API requise)."""
-        url = f'{base_url.rstrip("/")}/api/chat'
-        payload = json.dumps({
-            "model":  model,
-            "stream": False,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_message},
-            ],
-            "options": {"temperature": 0.1},
-        }).encode('utf-8')
-
-        req = Request(
-            url, data=payload, method='POST',
-            headers={'Content-Type': 'application/json'}
-        )
-        return self._http_call(req, provider='Ollama')
-
-    # ── HTTP helper commun ────────────────────────────────────────────────────
-
-    def _http_call(self, req: Request, provider: str) -> str:
+        proxy_url = None
         try:
-            with urlopen(req, timeout=60) as resp:
-                raw = resp.read().decode('utf-8', errors='replace')
-                data = json.loads(raw)
+            from decouple import config as dconfig
+            proxy_url = dconfig('PROXY_URL', default=None)
+        except Exception:
+            pass
 
-            # Extraction du texte selon chaque provider
-            if provider == 'OpenAI':
-                return data['choices'][0]['message']['content']
-            elif provider == 'Gemini':
-                return data['candidates'][0]['content']['parts'][0]['text']
-            elif provider == 'Ollama':
-                return data['message']['content']
-            return raw
+        proxy_url = (
+            proxy_url
+            or os.environ.get('https_proxy')
+            or os.environ.get('HTTPS_PROXY')
+            or os.environ.get('http_proxy')
+            or os.environ.get('HTTP_PROXY')
+        )
 
-        except HTTPError as exc:
-            err_body = exc.read().decode('utf-8', errors='replace')[:500]
-            raise RuntimeError(
-                f"[LogClassifier] {provider} HTTP {exc.code} — {exc.reason}\n"
-                f"Réponse: {err_body}"
+        hostname = urlparse(base_url).hostname or ''
+        bypass   = hostname in ('localhost', '127.0.0.1', '::1') \
+                   or hostname.endswith('.attijariwafa.net')
+
+        import httpx
+        client_kwargs = {}
+        if proxy_url and not bypass:
+            if '://' not in proxy_url:
+                proxy_url = f'http://{proxy_url}'
+            client_kwargs['proxy'] = proxy_url
+
+        http_client = httpx.Client(
+            verify=False, trust_env=False, **client_kwargs
+        )
+
+        client = openai.OpenAI(
+            api_key     = api_key,
+            base_url    = base_url,
+            http_client = http_client,
+        )
+
+        try:
+            response = client.chat.completions.create(
+                model           = model,
+                messages        = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_message},
+                ],
+                temperature     = 0.1,
+                max_tokens      = 2000,
+                response_format = {"type": "json_object"},
             )
-        except URLError as exc:
-            raise RuntimeError(
-                f"[LogClassifier] Impossible de joindre {provider} : {exc}"
+            content = response.choices[0].message.content
+            logger.info(
+                f'[LogClassifier] Réponse reçue — '
+                f'tokens={response.usage.total_tokens if response.usage else "?"}'
             )
-        except (KeyError, IndexError) as exc:
+            return content
+
+        except openai.AuthenticationError as exc:
+            raise RuntimeError(f"[LogClassifier] Auth LiteLLM : {exc}")
+        except openai.APIConnectionError as exc:
             raise RuntimeError(
-                f"[LogClassifier] Format de réponse {provider} inattendu : {exc}\n"
-                f"Réponse brute reçue — vérifiez le modèle configuré."
+                f"[LogClassifier] Connexion LiteLLM impossible : {exc}\n"
+                f"URL: {base_url}"
+            )
+        except openai.APIStatusError as exc:
+            raise RuntimeError(
+                f"[LogClassifier] LiteLLM HTTP {exc.status_code}: {exc.message}"
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"[LogClassifier] Erreur inattendue : {type(exc).__name__}: {exc}"
             )
 
     # ── Parsing de la réponse ─────────────────────────────────────────────────
 
-    def _parse_ai_response(self, raw: str, provider: str) -> dict:
-        """Extrait le JSON de la réponse IA (robuste aux markdown fences)."""
+    def _parse_ai_response(self, raw: str) -> dict:
         text = raw.strip()
-
-        # Retire les backticks markdown si présents (ex: ```json ... ```)
         text = re.sub(r'^```(?:json)?\s*', '', text)
-        text = re.sub(r'\s*```$', '', text)
+        text = re.sub(r'\s*```$',          '', text)
 
         try:
             result = json.loads(text)
-            # Assure la présence des champs minimaux
-            result.setdefault('summary', 'Analyse complétée.')
-            result.setdefault('overall_health', 'UNKNOWN')
-            result.setdefault('critical_count', 0)
-            result.setdefault('error_count', 0)
-            result.setdefault('warning_count', 0)
-            result.setdefault('info_count', 0)
-            result.setdefault('anomalies', [])
-            result.setdefault('top_errors', [])
+            result.setdefault('summary',                'Analyse complétée.')
+            result.setdefault('overall_health',         'UNKNOWN')
+            result.setdefault('critical_count',         0)
+            result.setdefault('error_count',            0)
+            result.setdefault('warning_count',          0)
+            result.setdefault('info_count',             0)
+            result.setdefault('anomalies',              [])
+            result.setdefault('top_errors',             [])
             result.setdefault('needs_immediate_action', False)
-            result.setdefault('immediate_actions', [])
+            result.setdefault('immediate_actions',      [])
             return result
 
         except (json.JSONDecodeError, ValueError) as exc:
-            logger.warning(
-                f'[LogClassifier] Réponse IA non-JSON ({provider}) — '
-                f'parsing de secours activé. Erreur: {exc}'
-            )
-            # Fallback : retourne la réponse brute dans le résumé
+            logger.warning(f'[LogClassifier] Parsing de secours : {exc}')
             return {
-                'summary': raw[:1000],
-                'overall_health': 'UNKNOWN',
-                'critical_count': 0, 'error_count': 0,
-                'warning_count': 0,  'info_count': 0,
-                'anomalies': [], 'top_errors': [],
+                'summary':                raw[:500],
+                'overall_health':         'UNKNOWN',
+                'critical_count':         0,
+                'error_count':            0,
+                'warning_count':          0,
+                'info_count':             0,
+                'anomalies':              [],
+                'top_errors':             [],
                 'needs_immediate_action': False,
-                'immediate_actions': [],
-                '_parse_error': str(exc),
-                '_raw_response': raw[:500],
+                'immediate_actions':      [],
+                '_parse_error':           str(exc),
             }
+
+    def _empty_result(self, output_key: str) -> dict:
+        empty = {
+            'summary':                'Aucun log à analyser.',
+            'overall_health':         'HEALTHY',
+            'critical_count':         0,
+            'error_count':            0,
+            'warning_count':          0,
+            'info_count':             0,
+            'anomalies':              [],
+            'top_errors':             [],
+            'needs_immediate_action': False,
+            'immediate_actions':      [],
+        }
+        return {
+            output_key:         empty,
+            'ai_analysis':      empty,
+            'ai_logs_analyzed': 0,
+            'ai_source':        'none',
+        }

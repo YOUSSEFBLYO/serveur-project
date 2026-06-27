@@ -110,7 +110,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'Africa/Casablanca'
 
 USE_I18N = True
 
@@ -136,7 +136,7 @@ CELERY_RESULT_BACKEND      = 'redis://localhost:6379/1'   # résultats des tâch
 CELERY_ACCEPT_CONTENT      = ['json']
 CELERY_TASK_SERIALIZER     = 'json'
 CELERY_RESULT_SERIALIZER   = 'json'
-CELERY_TIMEZONE            = 'UTC'
+CELERY_TIMEZONE            = 'Africa/Casablanca'
 CELERY_TASK_TRACK_STARTED  = True       # statut STARTED visible dans le monitoring
 CELERY_TASK_TIME_LIMIT     = 3600       # 1 h max par tâche (sécurité)
 CELERY_TASK_SOFT_TIME_LIMIT = 3500      # avertissement 100 s avant la limite dure

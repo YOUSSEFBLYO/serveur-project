@@ -22,6 +22,9 @@ urlpatterns = [
     path('executions/',                          views.execution_list,       name='execution-list'),
     path('executions/<int:execution_id>/detail/',views.execution_detail,     name='execution-detail'),
 
+    # ── Rapport AIOps HTML ───────────────────────────────────────────────────
+    path('executions/<int:execution_id>/report/', views.execution_report,    name='execution-report'),
+
     # ── Annulation ───────────────────────────────────────────────────────────
     path('executions/<int:execution_id>/cancel/',                views.execution_cancel,     name='execution-cancel'),
 ]

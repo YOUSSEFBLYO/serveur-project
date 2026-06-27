@@ -578,6 +578,59 @@ def execution_detail(request, execution_id):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Rapport AIOps — rapport HTML d’une exécution
+# ══════════════════════════════════════════════════════════════════════════════
+
+@api_view(['GET'])
+def execution_report(request, execution_id):
+    """
+    GET /api/v2/workflows/executions/{execution_id}/report/
+    Cherche le rapport HTML généré par un nœud ReportGenerator dans les outputs.
+    Retourne : { has_report, html, node_label, health, generated_at }
+    """
+    execution = get_object_or_404(Execution, pk=execution_id)
+
+    # Cherche le premier nœud de type aiops.ReportGenerator (ou variantes) ou contenant un rapport
+    report_node = None
+    for ne in execution.node_executions.order_by('step_number'):
+        outputs = ne.outputs or {}
+        # Vérifie s'il y a un rapport HTML direct ou si c'est un nœud ReportGenerator avec un rapport
+        has_report_keys = any(k in outputs for k in ('aiops_report_html', 'report_html', 'aiops_report', 'report'))
+        is_report_node = ne.node_type in ('aiops.ReportGenerator', 'aiops_report_generator', 'AIOpsReportGenerator')
+        if has_report_keys or is_report_node:
+            report_node = ne
+            break
+
+    if not report_node:
+        return Response({
+            'has_report': False,
+            'html':        None,
+            'node_label':  None,
+        })
+
+    outputs = report_node.outputs or {}
+    html_content = (
+        outputs.get('aiops_report_html')
+        or outputs.get('report_html')
+        or outputs.get('aiops_report')
+        or outputs.get('report')
+        or ''
+    )
+
+    health_status = outputs.get('report_health') or outputs.get('health') or 'UNKNOWN'
+
+    return Response({
+        'has_report':   bool(html_content),
+        'html':         html_content,
+        'node_label':   report_node.label,
+        'health':       health_status,
+        'generated_at': report_node.finished_at,
+        'execution_id': execution_id,
+        'workflow_name': execution.workflow.name,
+    })
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Helper interne
 # ══════════════════════════════════════════════════════════════════════════════
 
